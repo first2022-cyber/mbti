@@ -1,7 +1,9 @@
 
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
 import re
+import json
 from urllib.parse import quote
 
 # ---------------------------------
@@ -15,7 +17,6 @@ st.set_page_config(
 
 BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 
-# 교육용 인기 물질
 POPULAR = {
     "물 (Water)": "water",
     "산소 (Oxygen)": "oxygen",
@@ -29,17 +30,16 @@ POPULAR = {
     "셀룰로스 (Cellulose)": "cellulose",
 }
 
+
 # ---------------------------------
-# PubChem API 함수
+# PubChem API
 # ---------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_compound(name):
-    """물질명으로 PubChem 기본 정보를 조회한다."""
-    encoded_name = quote(name, safe="")
     url = (
-        f"{BASE_URL}/compound/name/{encoded_name}"
+        f"{BASE_URL}/compound/name/{quote(name, safe='')}"
         "/property/MolecularFormula,MolecularWeight,"
-        "IUPACName,InChIKey,CanonicalSMILES/JSON"
+        "IUPACName,InChIKey,ConnectivitySMILES/JSON"
     )
 
     response = requests.get(url, timeout=20)
@@ -48,45 +48,42 @@ def get_compound(name):
         return None
 
     response.raise_for_status()
-    data = response.json()
 
-    properties = data.get("PropertyTable", {}).get("Properties", [])
+    properties = (
+        response.json()
+        .get("PropertyTable", {})
+        .get("Properties", [])
+    )
 
-    if not properties:
-        return None
-
-    return properties[0]
+    return properties[0] if properties else None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_synonyms(cid):
-    """물질의 동의어 목록에서 CAS 등록번호를 찾아본다."""
     url = f"{BASE_URL}/compound/cid/{cid}/synonyms/JSON"
     response = requests.get(url, timeout=20)
 
     if response.status_code != 200:
         return []
 
-    data = response.json()
-    records = data.get("InformationList", {}).get("Information", [])
+    records = response.json().get(
+        "InformationList", {}
+    ).get("Information", [])
 
-    if records:
-        return records[0].get("Synonym", [])
-
-    return []
+    return records[0].get("Synonym", []) if records else []
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_description(cid):
-    """PubChem 물질 설명을 가져온다."""
     url = f"{BASE_URL}/compound/cid/{cid}/description/JSON"
     response = requests.get(url, timeout=20)
 
     if response.status_code != 200:
         return ""
 
-    data = response.json()
-    records = data.get("InformationList", {}).get("Information", [])
+    records = response.json().get(
+        "InformationList", {}
+    ).get("Information", [])
 
     for record in records:
         if record.get("Description"):
@@ -95,52 +92,204 @@ def get_description(cid):
     return ""
 
 
-def find_cas(synonyms):
-    """동의어에서 CAS 번호 형식의 문자열을 찾는다."""
-    pattern = re.compile(r"^\d{2,7}-\d{2}-\d$")
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_3d_sdf(cid):
+    """PubChem에서 3차원 좌표가 포함된 SDF를 가져온다."""
+    url = f"{BASE_URL}/compound/cid/{cid}/SDF"
 
+    response = requests.get(
+        url,
+        params={"record_type": "3d"},
+        timeout=30
+    )
+
+    if response.status_code != 200:
+        return None
+
+    sdf = response.text.strip()
+
+    if not sdf or "V2000" not in sdf and "V3000" not in sdf:
+        return None
+
+    return sdf
+
+
+def find_cas(synonyms):
+    pattern = re.compile(r"^\d{2,7}-\d{2}-\d$")
     for synonym in synonyms:
         if pattern.match(synonym):
             return synonym
-
     return "제공 정보 없음"
 
 
 # ---------------------------------
-# 화면 디자인
+# 3D 분자 뷰어
+# ---------------------------------
+def show_3d_molecule(sdf):
+    # SDF 데이터를 JavaScript 문자열로 안전하게 전달
+    sdf_json = json.dumps(sdf).replace("</", "<\\/")
+
+    html_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <script src="https://3dmol.org/build/3Dmol-min.js"></script>
+      <style>
+        body {{
+          margin: 0;
+          font-family: sans-serif;
+          background: #ffffff;
+        }}
+        #viewer {{
+          width: 100%;
+          height: 460px;
+          position: relative;
+          border: 1px solid #e5e7eb;
+          border-radius: 12px;
+          overflow: hidden;
+        }}
+        .controls {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin-top: 10px;
+        }}
+        button {{
+          padding: 9px 15px;
+          border: 1px solid #d1d5db;
+          border-radius: 8px;
+          background: white;
+          cursor: pointer;
+          font-size: 14px;
+        }}
+        button:hover {{
+          background: #f3f4f6;
+        }}
+        .hint {{
+          color: #555;
+          font-size: 13px;
+          margin-top: 8px;
+        }}
+      </style>
+    </head>
+    <body>
+      <div id="viewer"></div>
+
+      <div class="controls">
+        <button onclick="setStyle('stick')">막대 모형</button>
+        <button onclick="setStyle('sphere')">공 모형</button>
+        <button onclick="setStyle('ballstick')">공-막대 모형</button>
+        <button onclick="resetView()">처음 화면</button>
+      </div>
+
+      <div class="hint">
+        마우스로 끌기: 회전 · 휠: 확대/축소
+      </div>
+
+      <script>
+        const sdfData = {sdf_json};
+        const elementColors = {{
+          H: 0xeeeeee,
+          C: 0x555555,
+          N: 0x3050f8,
+          O: 0xff2020,
+          F: 0x90e050,
+          Cl: 0x1ff01f,
+          Br: 0xa62929,
+          I: 0x940094,
+          S: 0xffff30,
+          P: 0xff8000
+        }};
+
+        const elementRadii = {{
+          H: 0.28, C: 0.38, N: 0.36, O: 0.34,
+          F: 0.32, Cl: 0.38, Br: 0.42, I: 0.45,
+          S: 0.40, P: 0.40
+        }};
+
+        const viewer = $3Dmol.createViewer(
+          document.getElementById("viewer"),
+          {{ backgroundColor: "white" }}
+        );
+
+        viewer.addModel(sdfData, "sdf");
+
+        function setStyle(mode) {{
+          viewer.setStyle({{}}, {{}});
+          if (mode === "stick") {{
+            viewer.setStyle({{}}, {{
+              stick: {{ radius: 0.16, colorscheme: "Jmol" }}
+            }});
+          }} else if (mode === "sphere") {{
+            viewer.setStyle({{}}, {{
+              sphere: {{
+                scale: 0.32,
+                colorscheme: "Jmol"
+              }}
+            }});
+          }} else {{
+            viewer.setStyle({{}}, {{
+              stick: {{ radius: 0.14, colorscheme: "Jmol" }},
+              sphere: {{ scale: 0.25, colorscheme: "Jmol" }}
+            }});
+          }}
+          viewer.zoomTo();
+          viewer.render();
+        }}
+
+        function resetView() {{
+          viewer.zoomTo();
+          viewer.render();
+        }}
+
+        setStyle("ballstick");
+      </script>
+    </body>
+    </html>
+    """
+
+    components.html(html_code, height=555, scrolling=False)
+
+
+# ---------------------------------
+# 화면
 # ---------------------------------
 st.title("🧪 PubChem 물질 탐험")
 st.write(
-    "관심 있는 물질을 선택하거나 직접 검색해 "
-    "분자식과 분자량 등 화학 정보를 알아보세요."
+    "물질을 검색하고 분자식, 분자량, "
+    "2D 이미지와 3D 입체 구조를 탐색해 보세요."
 )
 
 st.caption(
-    "데이터 출처: NIH PubChem 공개 데이터베이스 · "
-    "검색 결과는 데이터베이스의 등록 정보에 따라 달라질 수 있습니다."
+    "데이터 출처: NIH PubChem · "
+    "3D 시각화: 3Dmol.js"
 )
 
 st.divider()
-
-# 인기 물질 선택
 st.subheader("🔎 물질 검색")
 
 tab1, tab2 = st.tabs(["⭐ 인기 물질", "⌨️ 직접 검색"])
 
 with tab1:
     selected = st.selectbox(
-        "알아보고 싶은 물질을 선택하세요.",
+        "물질 선택",
         list(POPULAR.keys())
     )
-    if st.button("물질 정보 조회", key="popular_search",
-                 type="primary", use_container_width=True):
+
+    if st.button(
+        "물질 정보 조회",
+        key="popular_search",
+        type="primary",
+        use_container_width=True
+    ):
         st.session_state["chemical_query"] = POPULAR[selected]
 
 with tab2:
     with st.form("search_form"):
         search_name = st.text_input(
             "물질 이름 또는 화학식",
-            placeholder="예: water, glucose, NaCl"
+            placeholder="예: water, glucose, aspirin, NaCl"
         )
         submitted = st.form_submit_button(
             "🔍 검색",
@@ -153,8 +302,9 @@ with tab2:
         else:
             st.warning("검색할 물질 이름이나 화학식을 입력하세요.")
 
+
 # ---------------------------------
-# 검색 결과 표시
+# 검색 결과
 # ---------------------------------
 if "chemical_query" in st.session_state:
     query = st.session_state["chemical_query"]
@@ -168,32 +318,23 @@ if "chemical_query" in st.session_state:
 
         if compound is None:
             st.warning(
-                "해당 물질을 찾지 못했습니다. "
-                "영문 물질명이나 화학식을 사용해 다시 검색해 보세요."
+                "물질을 찾지 못했습니다. "
+                "영문 물질명으로 다시 검색해 보세요."
             )
         else:
-            cid = compound.get("CID")
+            cid = compound["CID"]
             formula = compound.get("MolecularFormula", "정보 없음")
             weight = compound.get("MolecularWeight")
             iupac = compound.get("IUPACName", "정보 없음")
             inchikey = compound.get("InChIKey", "정보 없음")
             smiles = compound.get("ConnectivitySMILES", "정보 없음")
 
-            synonyms = get_synonyms(cid)
-            cas = find_cas(synonyms)
-            description = get_description(cid)
-
-            # 물질 정보 카드
-            st.success("물질 정보를 찾았습니다!")
-
             c1, c2, c3 = st.columns(3)
-
             c1.metric("PubChem CID", str(cid))
             c2.metric("분자식", formula)
             c3.metric(
                 "분자량 (g/mol)",
-                f"{float(weight):,.3f}" if weight is not None
-                else "정보 없음"
+                f"{float(weight):,.3f}" if weight is not None else "정보 없음"
             )
 
             st.markdown("### 🧬 물질 상세 정보")
@@ -207,22 +348,51 @@ if "chemical_query" in st.session_state:
                 )
                 st.image(
                     image_url,
-                    caption="PubChem 분자 구조 이미지",
+                    caption="PubChem 2D 구조",
                     use_container_width=True
                 )
 
             with right:
-                st.markdown(f"**물질명:** {query}")
-                st.markdown(f"**CAS 등록번호:** {cas}")
+                st.markdown(f"**검색어:** {query}")
                 st.markdown(f"**IUPAC 이름:** {iupac}")
                 st.markdown(f"**InChIKey:** `{inchikey}`")
                 st.markdown(f"**SMILES:** `{smiles}`")
+
+                synonyms = get_synonyms(cid)
+                st.markdown(f"**CAS 등록번호:** {find_cas(synonyms)}")
 
                 st.link_button(
                     "PubChem 공식 페이지 열기 ↗",
                     f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}"
                 )
 
+            # 3D 입체 구조
+            st.divider()
+            st.markdown("### 🧊 3D 입체 분자 구조")
+            st.write(
+                "마우스로 분자를 회전하고 확대·축소할 수 있습니다. "
+                "버튼으로 분자 표현 방식도 바꿔 보세요."
+            )
+
+            try:
+                with st.spinner("3D 구조를 불러오는 중입니다..."):
+                    sdf = get_3d_sdf(cid)
+
+                if sdf:
+                    show_3d_molecule(sdf)
+                else:
+                    st.info(
+                        "이 물질은 PubChem에서 3D 좌표를 가져오지 못했습니다. "
+                        "2D 구조와 기본 정보는 위에서 확인할 수 있습니다."
+                    )
+
+            except requests.exceptions.RequestException:
+                st.warning(
+                    "3D 구조를 가져오지 못했습니다. "
+                    "잠시 후 다시 시도해 주세요."
+                )
+
+            description = get_description(cid)
             if description:
                 st.markdown("### 📖 물질 설명")
                 st.write(description)
@@ -232,31 +402,28 @@ if "chemical_query" in st.session_state:
                 st.write("**분자식:**", formula)
                 st.write("**분자량:**", weight)
                 st.write("**동의어:**")
-                if synonyms:
-                    st.write(", ".join(synonyms[:20]))
-                else:
-                    st.write("동의어 정보가 없습니다.")
+                st.write(", ".join(synonyms[:20]) if synonyms else "정보 없음")
 
-            st.info(
-                "참고: 분자 구조 그림이나 일부 속성은 "
-                "PubChem의 응답 상태에 따라 표시되지 않을 수 있습니다. "
-                "CAS 번호도 모든 물질에서 제공되는 것은 아닙니다."
+            st.caption(
+                "3D 구조는 PubChem에서 제공하는 좌표를 표시합니다. "
+                "시각화된 구조가 모든 환경에서 실제 분자의 움직임이나 "
+                "안정한 형태를 그대로 나타내는 것은 아닙니다."
             )
 
     except requests.exceptions.Timeout:
-        st.error("PubChem 응답 시간이 초과되었습니다. 잠시 후 다시 시도하세요.")
+        st.error("응답 시간이 초과되었습니다. 잠시 후 다시 시도하세요.")
 
     except requests.exceptions.RequestException:
         st.error(
-            "PubChem 서버에 연결하지 못했습니다. "
-            "인터넷 연결이나 PubChem 서비스 상태를 확인하세요."
+            "PubChem에 연결하지 못했습니다. "
+            "인터넷 연결이나 서버 상태를 확인하세요."
         )
 
     except (ValueError, KeyError, TypeError):
-        st.error("응답 데이터를 처리하지 못했습니다. 다른 검색어를 사용해 보세요.")
+        st.error("데이터 처리 중 문제가 발생했습니다. 다시 검색해 주세요.")
 
 st.divider()
 st.caption(
-    "교육용 화학 정보 탐색 도구입니다. "
-    "데이터 조회 결과만으로 물질의 안전성을 판단하지 마세요."
+    "교육용 화학 정보 탐색 도구 · "
+    "PubChem 공개 API와 3Dmol.js를 이용합니다."
 )
